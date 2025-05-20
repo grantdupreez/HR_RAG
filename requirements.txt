@@ -1,10 +1,7 @@
 streamlit
-anthropic
-langchain-community
+anthropic>=0.18.0
+chromadb
+PyPDF2
 langchain-text-splitters
-langchain-openai
-langchain-qdrant
-pypdf
-qdrant-client
-openai
+pandas
 uuid
