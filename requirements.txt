@@ -1,0 +1,9 @@
+streamlit
+anthropic
+langchain-community
+langchain-text-splitters
+langchain-openai
+pypdf
+qdrant-client
+openai
+uuid
