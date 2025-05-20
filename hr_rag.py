@@ -7,13 +7,12 @@ import hmac
 import json
 import re
 import pandas as pd
-import chromadb
-from chromadb.config import Settings
 from datetime import datetime
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import PyPDF2
 import io
-import base64
+import chromadb
+from chromadb.utils import embedding_functions
 
 # Page configuration
 st.set_page_config(
@@ -92,51 +91,89 @@ os.makedirs(HR_DOCS_DIR, exist_ok=True)
 
 # ----------------- CHROMA DB SETUP -----------------
 
-# Initialize ChromaDB
+# Configure ChromaDB with settings for either local or cloud persistence
 def get_chroma_client():
-    client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory="./chroma_db"
-    ))
-    return client
+    """Get a ChromaDB client configured for cloud persistence."""
+    try:
+        # Config for Streamlit Cloud
+        # Use in-memory storage with HTTP persistence
+        client = chromadb.HttpClient(
+            host=st.secrets.get("CHROMADB_HOST", "localhost"),
+            port=st.secrets.get("CHROMADB_PORT", 8000),
+            ssl=st.secrets.get("CHROMADB_SSL", False),
+            headers={"X-Api-Key": st.secrets.get("CHROMADB_API_KEY", "")}
+        )
+        return client
+    except Exception as e:
+        st.error(f"Error connecting to ChromaDB: {str(e)}")
+        # Fallback to in-memory client if HTTP fails
+        st.warning("Using in-memory ChromaDB as fallback. Data will not persist between sessions.")
+        return chromadb.Client()
+
+# Custom embedding function that uses Anthropic's API
+class AnthropicEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    def __init__(self, api_key):
+        self.client = anthropic.Anthropic(api_key=api_key)
+    
+    def __call__(self, texts):
+        """Get embeddings for a list of texts using Anthropic's API."""
+        if not texts:
+            return []
+            
+        embeddings = []
+        for text in texts:
+            # Skip empty texts
+            if not text or not text.strip():
+                # Return zero embedding
+                embeddings.append([0] * 1536)
+                continue
+                
+            try:
+                # Truncate text if too long
+                truncated_text = text[:8000] if len(text) > 8000 else text
+                
+                response = self.client.embeddings.create(
+                    model="claude-3-haiku-20240307",
+                    input=truncated_text
+                )
+                embeddings.append(response.embedding)
+            except Exception as e:
+                st.error(f"Error generating embeddings: {str(e)}")
+                # Return a zero embedding as fallback
+                embeddings.append([0] * 1536)
+        
+        return embeddings
+
+# Get ChromaDB embedding function
+def get_embedding_function():
+    return AnthropicEmbeddingFunction(api_key=ANTHROPIC_API_KEY)
 
 # Get or create a collection
 def get_or_create_collection(client, collection_name):
     try:
-        # Try to get the collection
-        collection = client.get_collection(name=collection_name)
-    except:
-        # Create if it doesn't exist
-        collection = client.create_collection(name=collection_name)
-    
-    return collection
-
-# ----------------- CLAUDE EMBEDDINGS -----------------
-
-def get_claude_embeddings(texts):
-    """Get embeddings from Claude for a list of texts."""
-    if not texts:
-        return []
+        # Check if collection exists
+        collections = client.list_collections()
+        exists = any(c.name == collection_name for c in collections)
         
-    embeddings = []
-    for text in texts:
-        # Skip empty texts
-        if not text or not text.strip():
-            embeddings.append([0] * 1536)  # Default embedding size
-            continue
-            
-        try:
-            response = anthropic_client.embeddings.create(
-                model="claude-3-haiku-20240307",
-                input=text
+        if exists:
+            # Get existing collection
+            collection = client.get_collection(
+                name=collection_name,
+                embedding_function=get_embedding_function()
             )
-            embeddings.append(response.embedding)
-        except Exception as e:
-            st.error(f"Error generating embeddings: {str(e)}")
-            # Return a zero embedding as fallback
-            embeddings.append([0] * 1536)
+        else:
+            # Create new collection
+            collection = client.create_collection(
+                name=collection_name,
+                embedding_function=get_embedding_function()
+            )
+        
+        return collection
     
-    return embeddings
+    except Exception as e:
+        st.error(f"Error with ChromaDB collection: {str(e)}")
+        # Return None and handle error elsewhere
+        return None
 
 # ----------------- DOCUMENT PROCESSING -----------------
 
@@ -278,40 +315,47 @@ def add_document_to_collection(collection, processed_doc, document_id):
         # Add the chunk text
         documents.append(chunk["content"])
     
-    # Get embeddings for all chunks
-    embeddings = get_claude_embeddings(documents)
-    
-    # Add to collection
+    # Add to collection (ChromaDB handles the embeddings with our function)
     if documents:
-        collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=documents
-        )
+        try:
+            collection.add(
+                ids=ids,
+                metadatas=metadatas,
+                documents=documents
+            )
+            return len(documents)
+        except Exception as e:
+            st.error(f"Error adding documents to collection: {str(e)}")
+            return 0
     
-    return len(documents)
+    return 0
 
 # ----------------- RETRIEVAL FUNCTIONS -----------------
 
 def retrieve_relevant_chunks(collection, query, top_k=5):
     """Retrieve relevant chunks based on the query."""
-    # Get embedding for query
-    query_embedding = get_claude_embeddings([query])[0]
-    
-    # Search the collection
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k
-    )
-    
-    # Return results
-    return {
-        "ids": results["ids"][0] if results["ids"] else [],
-        "documents": results["documents"][0] if results["documents"] else [],
-        "metadatas": results["metadatas"][0] if results["metadatas"] else [],
-        "distances": results["distances"][0] if results["distances"] else []
-    }
+    try:
+        # Search the collection
+        results = collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
+        
+        # Format results
+        return {
+            "ids": results["ids"][0] if results["ids"] else [],
+            "documents": results["documents"][0] if results["documents"] else [],
+            "metadatas": results["metadatas"][0] if results["metadatas"] else [],
+            "distances": results["distances"][0] if results["distances"] else []
+        }
+    except Exception as e:
+        st.error(f"Error retrieving chunks: {str(e)}")
+        return {
+            "ids": [],
+            "documents": [],
+            "metadatas": [],
+            "distances": []
+        }
 
 def rerank_with_claude(query, search_results):
     """Use Claude to rerank search results by relevance."""
@@ -500,86 +544,104 @@ def show_admin_dashboard():
     with tab1:
         st.subheader("HR Document Management")
         
-        # Get available collections
-        chroma_client = get_chroma_client()
-        collections = chroma_client.list_collections()
-        collection_names = [collection.name for collection in collections]
-        
-        # Collection selection or creation
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if collection_names:
-                collection_option = st.selectbox(
-                    "Select Collection", 
-                    ["Create New Collection"] + collection_names
-                )
-            else:
-                collection_option = "Create New Collection"
-                st.info("No collections found. Create your first collection.")
-        
-        with col2:
-            if collection_option == "Create New Collection":
-                new_collection_name = st.text_input(
-                    "New Collection Name", 
-                    value=f"hr_policies_{uuid.uuid4().hex[:8]}"
-                )
-                selected_collection = new_collection_name
-            else:
-                selected_collection = collection_option
-        
-        # File uploader for multiple PDFs
-        uploaded_files = st.file_uploader(
-            "Upload HR Policy Documents (PDF)", 
-            type="pdf", 
-            accept_multiple_files=True
-        )
-        
-        # Process button
-        if st.button("Process HR Documents") and uploaded_files:
-            with st.spinner("Processing HR policy documents..."):
-                # Get or create collection
-                collection = get_or_create_collection(chroma_client, selected_collection)
-                
-                for uploaded_file in uploaded_files:
-                    # Display progress
-                    st.write(f"Processing: {uploaded_file.name}")
-                    
-                    # Generate a unique ID for this document
-                    doc_id = f"doc_{uuid.uuid4().hex}"
-                    
-                    # Extract text from PDF
-                    file_bytes = io.BytesIO(uploaded_file.getvalue())
-                    text = extract_text_from_pdf(file_bytes)
-                    
-                    # Process with Claude
-                    processed_doc = process_document_with_claude(text, uploaded_file.name)
-                    
-                    # Add to collection
-                    chunks_added = add_document_to_collection(collection, processed_doc, doc_id)
-                    
-                    st.write(f"Added {chunks_added} chunks from {uploaded_file.name}")
-                
-                # Save file to disk as well
-                for uploaded_file in uploaded_files:
-                    save_uploaded_file(uploaded_file)
-                
-                st.success(f"Successfully processed {len(uploaded_files)} HR policy documents")
-        
-        # Collection management
-        if collection_names:
-            st.subheader("Collection Management")
-            delete_collection = st.selectbox(
-                "Select Collection to Delete", 
-                [""] + collection_names
+        # Get ChromaDB client
+        try:
+            chroma_client = get_chroma_client()
+            st.success("✅ Connected to ChromaDB")
+            
+            # Get available collections
+            collections = chroma_client.list_collections()
+            collection_names = [collection.name for collection in collections]
+            
+            # Collection selection or creation
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if collection_names:
+                    collection_option = st.selectbox(
+                        "Select Collection", 
+                        ["Create New Collection"] + collection_names
+                    )
+                else:
+                    collection_option = "Create New Collection"
+                    st.info("No collections found. Create your first collection.")
+            
+            with col2:
+                if collection_option == "Create New Collection":
+                    new_collection_name = st.text_input(
+                        "New Collection Name", 
+                        value=f"hr_policies_{uuid.uuid4().hex[:8]}"
+                    )
+                    selected_collection = new_collection_name
+                else:
+                    selected_collection = collection_option
+            
+            # File uploader for multiple PDFs
+            uploaded_files = st.file_uploader(
+                "Upload HR Policy Documents (PDF)", 
+                type="pdf", 
+                accept_multiple_files=True
             )
-            if delete_collection and st.button("Delete Collection"):
-                try:
-                    chroma_client.delete_collection(delete_collection)
-                    st.success(f"Collection '{delete_collection}' deleted successfully!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error deleting collection: {str(e)}")
+            
+            # Process button
+            if st.button("Process HR Documents") and uploaded_files:
+                with st.spinner("Processing HR policy documents..."):
+                    try:
+                        # Get or create collection
+                        collection = get_or_create_collection(chroma_client, selected_collection)
+                        
+                        if collection:
+                            total_chunks = 0
+                            
+                            for uploaded_file in uploaded_files:
+                                # Display progress
+                                st.write(f"Processing: {uploaded_file.name}")
+                                
+                                # Generate a unique ID for this document
+                                doc_id = f"doc_{uuid.uuid4().hex}"
+                                
+                                # Extract text from PDF
+                                file_bytes = io.BytesIO(uploaded_file.getvalue())
+                                text = extract_text_from_pdf(file_bytes)
+                                
+                                # Process with Claude
+                                processed_doc = process_document_with_claude(text, uploaded_file.name)
+                                
+                                # Add to collection
+                                chunks_added = add_document_to_collection(collection, processed_doc, doc_id)
+                                total_chunks += chunks_added
+                                
+                                st.write(f"Added {chunks_added} chunks from {uploaded_file.name}")
+                            
+                            # Save file to disk as well
+                            for uploaded_file in uploaded_files:
+                                save_uploaded_file(uploaded_file)
+                            
+                            st.success(f"Successfully processed {len(uploaded_files)} HR policy documents with {total_chunks} total chunks")
+                        else:
+                            st.error("Failed to create or access the collection")
+                    
+                    except Exception as e:
+                        st.error(f"Error during document processing: {str(e)}")
+            
+            # Collection management
+            if collection_names:
+                st.subheader("Collection Management")
+                delete_collection = st.selectbox(
+                    "Select Collection to Delete", 
+                    [""] + collection_names
+                )
+                if delete_collection and st.button("Delete Collection"):
+                    try:
+                        chroma_client.delete_collection(delete_collection)
+                        st.success(f"Collection '{delete_collection}' deleted successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error deleting collection: {str(e)}")
+                        
+        except Exception as e:
+            st.error(f"Error connecting to ChromaDB: {str(e)}")
+            st.info("Make sure you have a ChromaDB server configured or update your secrets with ChromaDB configuration.")
     
     with tab2:
         st.subheader("Usage Analytics")
@@ -693,28 +755,38 @@ def process_user_query(query):
         message_placeholder = st.empty()
         message_placeholder.markdown("Searching HR policies...")
     
-    # Check if any collections exist
-    chroma_client = get_chroma_client()
-    collections = chroma_client.list_collections()
-    collection_names = [collection.name for collection in collections]
-    
-    if not collection_names:
-        response = "I don't have any HR policy documents loaded yet. Please ask your HR administrator to upload some policy documents."
-    else:
-        # Use the first collection for employee queries
-        collection = get_or_create_collection(chroma_client, collection_names[0])
+    try:
+        # Get ChromaDB client
+        chroma_client = get_chroma_client()
         
-        # Retrieve relevant chunks
-        with st.spinner("Searching HR policies..."):
-            search_results = retrieve_relevant_chunks(collection, query)
+        # Check if any collections exist
+        collections = chroma_client.list_collections()
+        collection_names = [collection.name for collection in collections]
+        
+        if not collection_names:
+            response = "I don't have any HR policy documents loaded yet. Please ask your HR administrator to upload some policy documents."
+        else:
+            # Use the first collection for employee queries
+            collection = get_or_create_collection(chroma_client, collection_names[0])
             
-            # Rerank results if we have more than one result
-            if len(search_results["documents"]) > 1:
-                search_results = rerank_with_claude(query, search_results)
-        
-        # Generate response with Claude
-        with st.spinner("Finding your answer..."):
-            response = generate_hr_response(query, search_results)
+            if collection:
+                # Retrieve relevant chunks
+                with st.spinner("Searching HR policies..."):
+                    search_results = retrieve_relevant_chunks(collection, query)
+                    
+                    # Rerank results if we have more than one result
+                    if len(search_results["documents"]) > 1:
+                        search_results = rerank_with_claude(query, search_results)
+                
+                # Generate response with Claude
+                with st.spinner("Finding your answer..."):
+                    response = generate_hr_response(query, search_results)
+            else:
+                response = "I'm having trouble accessing the HR policy documents. Please try again later or contact HR directly."
+    
+    except Exception as e:
+        st.error(f"Error processing query: {str(e)}")
+        response = "I encountered an error while trying to answer your question. Please try again later or contact HR directly."
     
     # Update assistant message
     message_placeholder.markdown(response)
