@@ -345,53 +345,53 @@ if "messages" not in st.session_state:
 
 # Auto-connect to the default Qdrant collection on startup
 if ("vectorstore" not in st.session_state and 
-    "collection_name" not in st.session_state and 
-    QDRANT_COLLECTION):
-    # Determine where to show messages based on user role
-    if st.session_state.user_role == "hr_admin":
-        message_placeholder = st.sidebar.empty()
-    else:
-        message_placeholder = st.empty()
-    
-    # Show connecting message
-    message_placeholder.info(f"Connecting to HR policy collection: {QDRANT_COLLECTION}...")
+    "collection_name" not in st.session_state):
     
     try:
-        # Connect to existing collection
+        # Get list of available collections
         qdrant_client_obj = get_qdrant_client()
-        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-        embeddings = OpenAIEmbeddings()
+        available_collections = get_collections()
         
-        # First check if collection exists before attempting to create vectorstore
-        try:
-            collection_info = qdrant_client_obj.get_collection(collection_name=QDRANT_COLLECTION)
-            # Collection exists, create vectorstore
-            vectorstore = Qdrant(
-                client=qdrant_client_obj,
-                collection_name=QDRANT_COLLECTION,
-                embeddings=embeddings
-            )
-            
-            # Save to session state
-            st.session_state.vectorstore = vectorstore
-            st.session_state.qdrant_client_obj = qdrant_client_obj
-            st.session_state.collection_name = QDRANT_COLLECTION
-            
-            # Show success message
-            success_message = f"Connected to HR policy collection: {QDRANT_COLLECTION}"
-            message_placeholder.success(success_message)
-            
-        except Exception as e:
-            # Collection not found or other error
-            st.warning(f"HR policy collection '{QDRANT_COLLECTION}' not found or could not be accessed. Error: {str(e)}")
-            if st.session_state.user_role == "hr_admin":
-                st.sidebar.info("Please create a new collection or select an existing one.")
+        # For HR admins, guide them to create a collection if none exist
+        if st.session_state.user_role == "hr_admin":
+            if not available_collections:
+                st.sidebar.warning("⚠️ No HR policy collections found. Please upload and process HR documents to create a collection.")
             else:
-                st.info("Please contact your HR administrator to set up the knowledge base.")
+                st.sidebar.info(f"Available collections: {', '.join(available_collections)}")
+                st.sidebar.info("Select a collection and click 'Process HR Documents' to connect.")
                 
+        # For employees, show appropriate message if no collections exist
+        else:
+            if not available_collections:
+                st.warning("⚠️ No HR policy collections are currently available. Please contact your HR administrator.")
+            else:
+                # Try to connect to the first available collection for employees
+                try:
+                    first_collection = available_collections[0]
+                    st.info(f"Connecting to HR policy collection: {first_collection}...")
+                    
+                    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+                    embeddings = OpenAIEmbeddings()
+                    
+                    vectorstore = Qdrant(
+                        client=qdrant_client_obj,
+                        collection_name=first_collection,
+                        embeddings=embeddings
+                    )
+                    
+                    # Save to session state
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.qdrant_client_obj = qdrant_client_obj
+                    st.session_state.collection_name = first_collection
+                    
+                    st.success(f"Connected to HR policy collection: {first_collection}")
+                except Exception as e:
+                    st.error(f"Error connecting to HR policy collection: {str(e)}")
+                    st.info("Please contact your HR administrator for assistance.")
+    
     except Exception as e:
-        # Connection error
-        error_message = f"Error connecting to HR policy collection: {str(e)}"
+        # Connection error to Qdrant server
+        error_message = f"Error connecting to HR knowledge base: {str(e)}"
         if st.session_state.user_role == "hr_admin":
             st.sidebar.error(error_message)
         else:
