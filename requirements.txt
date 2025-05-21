@@ -4,4 +4,6 @@ qdrant-client
 PyPDF2
 langchain-text-splitters
 pandas
+numpy
+openai
 uuid
