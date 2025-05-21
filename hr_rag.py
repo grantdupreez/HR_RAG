@@ -22,6 +22,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ----------------- CONSTANTS -----------------
+# Use a single collection for the entire application
+DEFAULT_COLLECTION = "hr_policies_main"
+
 # ----------------- AUTHENTICATION -----------------
 
 def check_password():
@@ -169,8 +173,8 @@ def get_claude_embeddings(texts):
     return embeddings
 
 # Create or get collection
-def get_or_create_collection(client, collection_name):
-    """Create a new collection or get an existing one."""
+def ensure_collection_exists(client, collection_name=DEFAULT_COLLECTION):
+    """Create a collection if it doesn't exist, or get the existing one."""
     try:
         # Check if collection exists
         collections = client.get_collections().collections
@@ -185,6 +189,7 @@ def get_or_create_collection(client, collection_name):
                     distance=models.Distance.COSINE
                 )
             )
+            st.success(f"Created new collection: {collection_name}")
         
         return collection_name
     
@@ -208,6 +213,40 @@ def save_uploaded_file(uploaded_file):
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return file_path
+
+def fix_json_string(json_str):
+    """Apply multiple cleaning operations to fix common JSON issues."""
+    # Remove non-JSON content before and after
+    json_str = re.sub(r'^[^{]*', '', json_str)
+    json_str = re.sub(r'[^}]*$', '', json_str)
+    
+    # Convert single quotes to double quotes for JSON keys and string values
+    # This regex tries to convert only where appropriate
+    json_str = re.sub(r"(?<={|\[|,|\s)'([^']*?)'(?=\s*:)", r'"\1"', json_str)  # Fix keys
+    json_str = re.sub(r'(?<=:)\s*\'([^\']*)\'(?=\s*[,}])', r' "\1"', json_str)  # Fix values
+    
+    # Fix missing commas between objects in arrays
+    json_str = re.sub(r'(\})\s*(\{)', r'\1,\2', json_str)
+    
+    # Fix missing commas between array items
+    json_str = re.sub(r'(\]|\})\s*("|\{|\[)', r'\1,\2', json_str)
+    
+    # Fix trailing commas in arrays and objects
+    json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+    
+    # Add quotes around unquoted string values
+    json_str = re.sub(r':\s*([a-zA-Z][a-zA-Z0-9_]*)(?=\s*[,}])', r': "\1"', json_str)
+    
+    # Replace NaN, Infinity, -Infinity with null (these are not valid JSON)
+    json_str = re.sub(r':\s*(NaN|-?Infinity)', r': null', json_str)
+    
+    # Remove newlines and tabs from within string values
+    json_str = re.sub(r'"[^"]*"', lambda m: m.group(0).replace('\n', '\\n').replace('\t', '\\t'), json_str)
+    
+    # Fix backslash escaping in strings
+    json_str = re.sub(r'(?<!\\)\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', json_str)
+    
+    return json_str
 
 def process_document_with_claude(file_content, file_name):
     """Use Claude to extract structured content from HR documents."""
@@ -252,14 +291,15 @@ def process_document_with_claude(file_content, file_name):
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-7-sonnet-20250219",
+            model="claude-3-sonnet-20240229",  # Using Sonnet instead of the newer model for better compatibility
             max_tokens=4000,
             system=system_prompt,
             messages=[{"role": "user", "content": f"Document name: {file_name}\n\nContent:\n{truncated_content}"}]
         )
         
-        # First try to extract JSON from code blocks
         content_text = response.content[0].text
+        
+        # First try to extract JSON from code blocks
         json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', content_text, re.DOTALL)
         
         if json_match:
@@ -273,21 +313,13 @@ def process_document_with_claude(file_content, file_name):
                 # If still no match, use the entire response
                 json_str = content_text
         
-        # Try to clean the JSON string
-        # Remove any non-JSON text before or after the JSON structure
-        json_str = re.sub(r'^[^{]*', '', json_str)
-        json_str = re.sub(r'[^}]*$', '', json_str)
-        
-        # Additional JSON cleaning steps for common issues
-        # Fix unescaped quotes in JSON strings
-        json_str = re.sub(r'(?<!")(")(?!")', r'\\"', json_str)
-        # Fix missing commas between array elements
-        json_str = re.sub(r'(\]|\})(\s*")', r'\1,\2', json_str)
+        # Try to fix JSON formatting issues using our enhanced function
+        cleaned_json = fix_json_string(json_str)
         
         # Parse the JSON
         try:
-            # Try parsing with minimal fixes
-            extracted_data = json.loads(json_str)
+            # Try parsing with extensive fixes
+            extracted_data = json.loads(cleaned_json)
             
             # Validate the expected structure
             if "metadata" not in extracted_data or "chunks" not in extracted_data:
@@ -297,11 +329,13 @@ def process_document_with_claude(file_content, file_name):
             return extracted_data
             
         except json.JSONDecodeError as e:
-            # Log the specific error for debugging
+            # Log the error and try a simpler backup approach
             st.warning(f"Could not parse Claude's JSON output for {file_name}: {str(e)}. Falling back to simple chunking.")
-            # Optionally write the problematic JSON to a log for inspection
+            
+            # Write the problematic JSON to a temporary file for inspection
             with open(f"json_error_{uuid.uuid4().hex[:8]}.log", "w") as f:
-                f.write(f"Error: {str(e)}\n\nJSON:\n{json_str}")
+                f.write(f"Error: {str(e)}\n\nOriginal JSON:\n{json_str}\n\nCleaned JSON:\n{cleaned_json}")
+            
             return fallback_chunking(file_content, file_name)
             
     except Exception as e:
@@ -347,11 +381,10 @@ def add_document_to_qdrant(client, collection_name, processed_doc, document_id):
     
     # Process each chunk
     for i, chunk in enumerate(processed_doc["chunks"]):
-        # Create a unique ID for the point - using UUID for Qdrant compatibility
-        # Convert the string ID to a proper UUID
+        # Create a unique ID for the point
         point_uuid = uuid.uuid4()
         
-        # Create metadata for this chunk - still keep the original document_id for reference
+        # Create metadata for this chunk
         metadata = {
             "doc_id": document_id,
             "doc_title": doc_metadata["title"],
@@ -360,7 +393,7 @@ def add_document_to_qdrant(client, collection_name, processed_doc, document_id):
             "audience": doc_metadata["audience"],
             "chunk_title": chunk["title"],
             "chunk_summary": chunk["summary"],
-            "chunk_index": i  # Store index for reference
+            "chunk_index": i
         }
         
         # Get embeddings for the chunk
@@ -369,7 +402,7 @@ def add_document_to_qdrant(client, collection_name, processed_doc, document_id):
         if chunk_embeddings:
             # Create a point
             point = models.PointStruct(
-                id=str(point_uuid),  # Using UUID string that Qdrant will accept
+                id=str(point_uuid),
                 vector=chunk_embeddings[0],
                 payload={
                     "metadata": metadata,
@@ -520,6 +553,8 @@ def rerank_with_claude(query, search_results):
         
         # Parse rankings
         try:
+            # Clean JSON before parsing
+            json_str = fix_json_string(json_str)
             rankings = json.loads(json_str)
             
             # Sort the results by score (descending)
@@ -674,109 +709,104 @@ def show_admin_dashboard():
         try:
             qdrant_client_obj = get_qdrant_client()
             
-            # Get collection status
-            try:
-                collections = qdrant_client_obj.get_collections().collections
-                collection_names = [collection.name for collection in collections]
+            # Ensure default collection exists
+            collection_name = ensure_collection_exists(qdrant_client_obj)
+            
+            if collection_name:
+                st.success(f"✅ Connected to Qdrant - Using collection: {collection_name}")
+            
+                # File uploader for multiple PDFs
+                uploaded_files = st.file_uploader(
+                    "Upload HR Policy Documents (PDF)", 
+                    type="pdf", 
+                    accept_multiple_files=True
+                )
                 
-                if collections:
-                    st.success(f"✅ Connected to Qdrant ({len(collections)} collections)")
-                else:
-                    st.info("✅ Connected to Qdrant (No collections yet)")
-            except Exception as e:
-                st.warning(f"⚠️ Connected to Qdrant but failed to get collections: {str(e)}")
-                collection_names = []
-            
-            # Collection selection or creation
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if collection_names:
-                    collection_option = st.selectbox(
-                        "Select Collection", 
-                        ["Create New Collection"] + collection_names
-                    )
-                else:
-                    collection_option = "Create New Collection"
-                    st.info("No collections found. Create your first collection.")
-            
-            with col2:
-                if collection_option == "Create New Collection":
-                    new_collection_name = st.text_input(
-                        "New Collection Name", 
-                        value=f"hr_policies_{uuid.uuid4().hex[:8]}"
-                    )
-                    selected_collection = new_collection_name
-                else:
-                    selected_collection = collection_option
-            
-            # File uploader for multiple PDFs
-            uploaded_files = st.file_uploader(
-                "Upload HR Policy Documents (PDF)", 
-                type="pdf", 
-                accept_multiple_files=True
-            )
-            
-            # Process button
-            if st.button("Process HR Documents") and uploaded_files:
-                with st.spinner("Processing HR policy documents..."):
+                # Process button
+                if st.button("Process HR Documents") and uploaded_files:
+                    # Create a progress bar for the entire process
+                    process_progress = st.progress(0)
+                    
+                    # Display information about what we're going to do
+                    st.info(f"Processing {len(uploaded_files)} files and adding them to collection '{collection_name}'")
+                    
+                    # Create a status area
+                    status_area = st.empty()
+                    
                     try:
-                        # Get or create collection
-                        collection_name = get_or_create_collection(qdrant_client_obj, selected_collection)
+                        total_chunks = 0
                         
-                        if collection_name:
-                            total_chunks = 0
+                        # Process each file with a status update
+                        for i, uploaded_file in enumerate(uploaded_files):
+                            # Update overall progress
+                            progress_pct = int((i / len(uploaded_files)) * 100)
+                            process_progress.progress(progress_pct)
                             
-                            for uploaded_file in uploaded_files:
-                                # Display progress
-                                st.write(f"Processing: {uploaded_file.name}")
-                                
-                                # Generate a unique ID for this document
-                                doc_id = f"doc_{uuid.uuid4().hex}"
-                                
-                                # Extract text from PDF
-                                file_bytes = io.BytesIO(uploaded_file.getvalue())
-                                text = extract_text_from_pdf(file_bytes)
-                                
-                                # Process with Claude
-                                processed_doc = process_document_with_claude(text, uploaded_file.name)
-                                
-                                # Add to Qdrant
-                                chunks_added = add_document_to_qdrant(
-                                    qdrant_client_obj, 
-                                    collection_name, 
-                                    processed_doc, 
-                                    doc_id
-                                )
-                                total_chunks += chunks_added
-                                
-                                st.write(f"Added {chunks_added} chunks from {uploaded_file.name}")
+                            # Display current file being processed
+                            status_area.info(f"Processing file {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
+                            
+                            # Generate a unique ID for this document
+                            doc_id = f"doc_{uuid.uuid4().hex}"
+                            
+                            # Extract text from PDF
+                            file_bytes = io.BytesIO(uploaded_file.getvalue())
+                            text = extract_text_from_pdf(file_bytes)
+                            
+                            # Process with Claude - show status update
+                            status_area.info(f"Analyzing {uploaded_file.name} with Claude...")
+                            processed_doc = process_document_with_claude(text, uploaded_file.name)
+                            
+                            # Add to Qdrant - show status update
+                            status_area.info(f"Adding {uploaded_file.name} to Qdrant...")
+                            chunks_added = add_document_to_qdrant(
+                                qdrant_client_obj, 
+                                collection_name, 
+                                processed_doc, 
+                                doc_id
+                            )
+                            total_chunks += chunks_added
+                            
+                            # Display success for this file
+                            status_area.success(f"Added {chunks_added} chunks from {uploaded_file.name}")
                             
                             # Save file to disk as well
-                            for uploaded_file in uploaded_files:
-                                save_uploaded_file(uploaded_file)
-                            
-                            st.success(f"Successfully processed {len(uploaded_files)} HR policy documents with {total_chunks} total chunks")
-                        else:
-                            st.error("Failed to create or access the collection")
-                    
+                            save_uploaded_file(uploaded_file)
+                        
+                        # Final progress update
+                        process_progress.progress(100)
+                        
+                        # Overall success message
+                        status_area.success(f"Successfully processed all {len(uploaded_files)} HR policy documents with {total_chunks} total chunks")
+                        
                     except Exception as e:
-                        st.error(f"Error during document processing: {str(e)}")
-            
-            # Collection management
-            if collection_names:
+                        process_progress.progress(100)
+                        status_area.error(f"Error during document processing: {str(e)}")
+                
+                # Collection management
                 st.subheader("Collection Management")
-                delete_collection = st.selectbox(
-                    "Select Collection to Delete", 
-                    [""] + collection_names
-                )
-                if delete_collection and st.button("Delete Collection"):
-                    try:
-                        qdrant_client_obj.delete_collection(collection_name=delete_collection)
-                        st.success(f"Collection '{delete_collection}' deleted successfully!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error deleting collection: {str(e)}")
+                
+                # Get collection info
+                try:
+                    collection_info = qdrant_client_obj.get_collection(collection_name=collection_name)
+                    points_count = qdrant_client_obj.count(collection_name=collection_name).count
+                    
+                    st.info(f"Collection '{collection_name}' has {points_count} document chunks.")
+                    
+                    # Clear collection option
+                    if st.button("Clear Collection"):
+                        # Confirm deletion
+                        if st.checkbox("I understand this will delete all HR policy data", key="confirm_delete"):
+                            try:
+                                # Delete and recreate the collection
+                                qdrant_client_obj.delete_collection(collection_name=collection_name)
+                                ensure_collection_exists(qdrant_client_obj, collection_name)
+                                st.success(f"Collection '{collection_name}' cleared successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error clearing collection: {str(e)}")
+                
+                except Exception as e:
+                    st.warning(f"Could not get collection info: {str(e)}")
         
         except Exception as e:
             st.error(f"Error connecting to Qdrant: {str(e)}")
@@ -911,48 +941,53 @@ def process_user_query(query):
         # Get Qdrant client
         qdrant_client_obj = get_qdrant_client()
         
-        # Check if any collections exist
-        collections = qdrant_client_obj.get_collections().collections
-        collection_names = [collection.name for collection in collections]
+        # Use our default collection
+        collection_name = DEFAULT_COLLECTION
         
-        if not collection_names:
-            response = "I don't have any HR policy documents loaded yet. Please ask your HR administrator to upload some policy documents."
-        else:
-            # Use the first collection for employee queries
-            collection_name = collection_names[0]
-            
-            # Add debugging information
+        # Check if collection exists
+        try:
+            collection_info = qdrant_client_obj.get_collection(collection_name=collection_name)
+        except Exception as e:
             if debug_mode:
-                st.info(f"Using collection: {collection_name}")
-            
-            # Retrieve relevant chunks
-            with st.spinner("Searching HR policies..."):
-                try:
-                    search_results = retrieve_relevant_chunks(qdrant_client_obj, collection_name, query)
-                    
-                    # Debug info about what we got back
-                    if debug_mode:
-                        st.info(f"Retrieved {len(search_results['documents'])} documents")
-                        if search_results['documents']:
-                            st.info(f"First document sample: {search_results['documents'][0][:100]}...")
-                    
-                    # Rerank results if we have more than one result
-                    if len(search_results["documents"]) > 1:
-                        search_results = rerank_with_claude(query, search_results)
-                except Exception as e:
-                    import traceback
-                    error_trace = traceback.format_exc()
-                    if debug_mode:
-                        st.error(f"Error during retrieval: {str(e)}")
-                        st.error(f"Traceback: {error_trace}")
-                    search_results = {"documents": [], "metadatas": [], "scores": []}
-            
-            # Generate response with Claude
-            with st.spinner("Finding your answer..."):
-                if search_results["documents"]:
-                    response = generate_hr_response(query, search_results)
-                else:
-                    response = "I couldn't find any relevant information in our HR policy documents. Please contact HR directly for assistance with your question."
+                st.error(f"Collection '{collection_name}' does not exist: {str(e)}")
+            response = "I don't have any HR policy documents loaded yet. Please ask your HR administrator to upload some policy documents."
+            message_placeholder.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            track_interaction(query, response, category)
+            return
+        
+        # Add debugging information
+        if debug_mode:
+            st.info(f"Using collection: {collection_name}")
+        
+        # Retrieve relevant chunks
+        with st.spinner("Searching HR policies..."):
+            try:
+                search_results = retrieve_relevant_chunks(qdrant_client_obj, collection_name, query)
+                
+                # Debug info about what we got back
+                if debug_mode:
+                    st.info(f"Retrieved {len(search_results['documents'])} documents")
+                    if search_results['documents']:
+                        st.info(f"First document sample: {search_results['documents'][0][:100]}...")
+                
+                # Rerank results if we have more than one result
+                if len(search_results["documents"]) > 1:
+                    search_results = rerank_with_claude(query, search_results)
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                if debug_mode:
+                    st.error(f"Error during retrieval: {str(e)}")
+                    st.error(f"Traceback: {error_trace}")
+                search_results = {"documents": [], "metadatas": [], "scores": []}
+        
+        # Generate response with Claude
+        with st.spinner("Finding your answer..."):
+            if search_results["documents"]:
+                response = generate_hr_response(query, search_results)
+            else:
+                response = "I couldn't find any relevant information in our HR policy documents. Please contact HR directly for assistance with your question."
     
     except Exception as e:
         import traceback
