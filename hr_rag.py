@@ -291,7 +291,7 @@ def process_document_with_claude(file_content, file_name):
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-sonnet-20240229",  # Using Sonnet instead of the newer model for better compatibility
+            model="claude-3-sonnet",  # Using Sonnet for good balance of quality and speed
             max_tokens=4000,
             system=system_prompt,
             messages=[{"role": "user", "content": f"Document name: {file_name}\n\nContent:\n{truncated_content}"}]
@@ -538,7 +538,7 @@ def rerank_with_claude(query, search_results):
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-3-haiku",
             max_tokens=1000,
             system=system_prompt,
             messages=[{"role": "user", "content": message}]
@@ -619,7 +619,7 @@ def generate_hr_response(query, search_results):
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-sonnet-20240229",
+            model="claude-3-sonnet",
             max_tokens=1000,
             system=system_prompt,
             messages=[{
@@ -651,7 +651,7 @@ def categorize_question(query):
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-3-haiku",
             max_tokens=50,
             system=system_prompt,
             messages=[{"role": "user", "content": query}]
