@@ -11,8 +11,8 @@ from datetime import datetime
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import PyPDF2
 import io
-import chromadb
-from chromadb.utils import embedding_functions
+import qdrant_client
+from qdrant_client.http import models
 
 # Page configuration
 st.set_page_config(
@@ -89,90 +89,81 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 HR_DOCS_DIR = "hr_documents"
 os.makedirs(HR_DOCS_DIR, exist_ok=True)
 
-# ----------------- CHROMA DB SETUP -----------------
+# ----------------- QDRANT SETUP -----------------
 
-# Configure ChromaDB with settings for either local or cloud persistence
-def get_chroma_client():
-    """Get a ChromaDB client configured for cloud persistence."""
+# Get Qdrant client
+def get_qdrant_client():
+    """Get a Qdrant client configured for cloud or local persistence."""
     try:
-        # Config for Streamlit Cloud
-        # Use in-memory storage with HTTP persistence
-        client = chromadb.HttpClient(
-            host=st.secrets.get("CHROMADB_HOST", "localhost"),
-            port=st.secrets.get("CHROMADB_PORT", 8000),
-            ssl=st.secrets.get("CHROMADB_SSL", False),
-            headers={"X-Api-Key": st.secrets.get("CHROMADB_API_KEY", "")}
-        )
-        return client
-    except Exception as e:
-        st.error(f"Error connecting to ChromaDB: {str(e)}")
-        # Fallback to in-memory client if HTTP fails
-        st.warning("Using in-memory ChromaDB as fallback. Data will not persist between sessions.")
-        return chromadb.Client()
-
-# Custom embedding function that uses Anthropic's API
-class AnthropicEmbeddingFunction(embedding_functions.EmbeddingFunction):
-    def __init__(self, api_key):
-        self.client = anthropic.Anthropic(api_key=api_key)
-    
-    def __call__(self, texts):
-        """Get embeddings for a list of texts using Anthropic's API."""
-        if not texts:
-            return []
-            
-        embeddings = []
-        for text in texts:
-            # Skip empty texts
-            if not text or not text.strip():
-                # Return zero embedding
-                embeddings.append([0] * 1536)
-                continue
-                
-            try:
-                # Truncate text if too long
-                truncated_text = text[:8000] if len(text) > 8000 else text
-                
-                response = self.client.embeddings.create(
-                    model="claude-3-haiku-20240307",
-                    input=truncated_text
+        if "QDRANT_URL" in st.secrets and st.secrets["QDRANT_URL"]:
+            # Cloud or remote Qdrant
+            if "QDRANT_API_KEY" in st.secrets and st.secrets["QDRANT_API_KEY"]:
+                # With API key
+                return qdrant_client.QdrantClient(
+                    url=st.secrets["QDRANT_URL"],
+                    api_key=st.secrets["QDRANT_API_KEY"]
                 )
-                embeddings.append(response.embedding)
-            except Exception as e:
-                st.error(f"Error generating embeddings: {str(e)}")
-                # Return a zero embedding as fallback
-                embeddings.append([0] * 1536)
+            else:
+                # Without API key
+                return qdrant_client.QdrantClient(
+                    url=st.secrets["QDRANT_URL"]
+                )
+        else:
+            # Local Qdrant (for development)
+            return qdrant_client.QdrantClient(":memory:")
+    except Exception as e:
+        st.error(f"Error connecting to Qdrant: {str(e)}")
+        # Fallback to in-memory
+        return qdrant_client.QdrantClient(":memory:")
+
+# Get Claude embeddings for texts
+def get_claude_embeddings(texts):
+    """Get embeddings from Claude for a list of texts."""
+    if not texts:
+        return []
         
-        return embeddings
+    embeddings = []
+    for text in texts:
+        # Skip empty texts
+        if not text or not text.strip():
+            embeddings.append([0] * 1536)  # Default embedding size
+            continue
+            
+        try:
+            response = anthropic_client.embeddings.create(
+                model="claude-3-haiku-20240307",
+                input=text
+            )
+            embeddings.append(response.embedding)
+        except Exception as e:
+            st.error(f"Error generating embeddings: {str(e)}")
+            # Return a zero embedding as fallback
+            embeddings.append([0] * 1536)
+    
+    return embeddings
 
-# Get ChromaDB embedding function
-def get_embedding_function():
-    return AnthropicEmbeddingFunction(api_key=ANTHROPIC_API_KEY)
-
-# Get or create a collection
+# Create or get collection
 def get_or_create_collection(client, collection_name):
+    """Create a new collection or get an existing one."""
     try:
         # Check if collection exists
-        collections = client.list_collections()
-        exists = any(c.name == collection_name for c in collections)
+        collections = client.get_collections().collections
+        exists = any(collection.name == collection_name for collection in collections)
         
-        if exists:
-            # Get existing collection
-            collection = client.get_collection(
-                name=collection_name,
-                embedding_function=get_embedding_function()
-            )
-        else:
+        if not exists:
             # Create new collection
-            collection = client.create_collection(
-                name=collection_name,
-                embedding_function=get_embedding_function()
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=models.VectorParams(
+                    size=1536,  # Claude embeddings size
+                    distance=models.Distance.COSINE
+                )
             )
         
-        return collection
+        return collection_name
     
     except Exception as e:
-        st.error(f"Error with ChromaDB collection: {str(e)}")
-        # Return None and handle error elsewhere
+        st.error(f"Error with Qdrant collection: {str(e)}")
         return None
 
 # ----------------- DOCUMENT PROCESSING -----------------
@@ -286,19 +277,17 @@ def fallback_chunking(text, file_name):
     
     return result
 
-def add_document_to_collection(collection, processed_doc, document_id):
-    """Add processed document chunks to the collection."""
-    ids = []
-    metadatas = []
-    documents = []
+def add_document_to_qdrant(client, collection_name, processed_doc, document_id):
+    """Add processed document chunks to Qdrant."""
+    points = []
     
     # Extract document metadata
     doc_metadata = processed_doc["metadata"]
     
     # Process each chunk
     for i, chunk in enumerate(processed_doc["chunks"]):
-        chunk_id = f"{document_id}_chunk_{i}"
-        ids.append(chunk_id)
+        # Create a unique ID for the point
+        point_id = f"{document_id}_{i}"
         
         # Create metadata for this chunk
         metadata = {
@@ -310,51 +299,74 @@ def add_document_to_collection(collection, processed_doc, document_id):
             "chunk_title": chunk["title"],
             "chunk_summary": chunk["summary"]
         }
-        metadatas.append(metadata)
         
-        # Add the chunk text
-        documents.append(chunk["content"])
-    
-    # Add to collection (ChromaDB handles the embeddings with our function)
-    if documents:
-        try:
-            collection.add(
-                ids=ids,
-                metadatas=metadatas,
-                documents=documents
+        # Get embeddings for the chunk
+        chunk_embeddings = get_claude_embeddings([chunk["content"]])
+        
+        if chunk_embeddings:
+            # Create a point
+            point = models.PointStruct(
+                id=point_id,
+                vector=chunk_embeddings[0],
+                payload={
+                    "metadata": metadata,
+                    "content": chunk["content"]
+                }
             )
-            return len(documents)
+            
+            points.append(point)
+    
+    # Add points to Qdrant
+    if points:
+        try:
+            client.upsert(
+                collection_name=collection_name,
+                points=points
+            )
+            return len(points)
         except Exception as e:
-            st.error(f"Error adding documents to collection: {str(e)}")
+            st.error(f"Error adding points to Qdrant: {str(e)}")
             return 0
     
     return 0
 
 # ----------------- RETRIEVAL FUNCTIONS -----------------
 
-def retrieve_relevant_chunks(collection, query, top_k=5):
+def retrieve_relevant_chunks(client, collection_name, query, top_k=5):
     """Retrieve relevant chunks based on the query."""
     try:
-        # Search the collection
-        results = collection.query(
-            query_texts=[query],
-            n_results=top_k
+        # Get embeddings for the query
+        query_embedding = get_claude_embeddings([query])[0]
+        
+        # Search in Qdrant
+        search_results = client.search(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=top_k
         )
         
-        # Format results
+        # Extract and format results
+        documents = []
+        metadatas = []
+        scores = []
+        
+        for result in search_results:
+            documents.append(result.payload["content"])
+            metadatas.append(result.payload["metadata"])
+            scores.append(result.score)
+        
         return {
-            "ids": results["ids"][0] if results["ids"] else [],
-            "documents": results["documents"][0] if results["documents"] else [],
-            "metadatas": results["metadatas"][0] if results["metadatas"] else [],
-            "distances": results["distances"][0] if results["distances"] else []
+            "documents": documents,
+            "metadatas": metadatas,
+            "scores": scores
         }
+    
     except Exception as e:
-        st.error(f"Error retrieving chunks: {str(e)}")
+        st.error(f"Error searching Qdrant: {str(e)}")
         return {
-            "ids": [],
             "documents": [],
             "metadatas": [],
-            "distances": []
+            "scores": []
         }
 
 def rerank_with_claude(query, search_results):
@@ -400,10 +412,9 @@ def rerank_with_claude(query, search_results):
             
             # Reorder the results
             reranked_results = {
-                "ids": [search_results["ids"][i] for i in sorted_indices],
                 "documents": [search_results["documents"][i] for i in sorted_indices],
                 "metadatas": [search_results["metadatas"][i] for i in sorted_indices],
-                "distances": [search_results["distances"][i] for i in sorted_indices] if search_results["distances"] else []
+                "scores": [search_results["scores"][i] for i in sorted_indices] if "scores" in search_results else []
             }
             
             return reranked_results
@@ -544,14 +555,22 @@ def show_admin_dashboard():
     with tab1:
         st.subheader("HR Document Management")
         
-        # Get ChromaDB client
+        # Get Qdrant client
         try:
-            chroma_client = get_chroma_client()
-            st.success("✅ Connected to ChromaDB")
+            qdrant_client_obj = get_qdrant_client()
             
-            # Get available collections
-            collections = chroma_client.list_collections()
-            collection_names = [collection.name for collection in collections]
+            # Get collection status
+            try:
+                collections = qdrant_client_obj.get_collections().collections
+                collection_names = [collection.name for collection in collections]
+                
+                if collections:
+                    st.success(f"✅ Connected to Qdrant ({len(collections)} collections)")
+                else:
+                    st.info("✅ Connected to Qdrant (No collections yet)")
+            except Exception as e:
+                st.warning(f"⚠️ Connected to Qdrant but failed to get collections: {str(e)}")
+                collection_names = []
             
             # Collection selection or creation
             col1, col2 = st.columns(2)
@@ -588,9 +607,9 @@ def show_admin_dashboard():
                 with st.spinner("Processing HR policy documents..."):
                     try:
                         # Get or create collection
-                        collection = get_or_create_collection(chroma_client, selected_collection)
+                        collection_name = get_or_create_collection(qdrant_client_obj, selected_collection)
                         
-                        if collection:
+                        if collection_name:
                             total_chunks = 0
                             
                             for uploaded_file in uploaded_files:
@@ -607,8 +626,13 @@ def show_admin_dashboard():
                                 # Process with Claude
                                 processed_doc = process_document_with_claude(text, uploaded_file.name)
                                 
-                                # Add to collection
-                                chunks_added = add_document_to_collection(collection, processed_doc, doc_id)
+                                # Add to Qdrant
+                                chunks_added = add_document_to_qdrant(
+                                    qdrant_client_obj, 
+                                    collection_name, 
+                                    processed_doc, 
+                                    doc_id
+                                )
                                 total_chunks += chunks_added
                                 
                                 st.write(f"Added {chunks_added} chunks from {uploaded_file.name}")
@@ -633,15 +657,15 @@ def show_admin_dashboard():
                 )
                 if delete_collection and st.button("Delete Collection"):
                     try:
-                        chroma_client.delete_collection(delete_collection)
+                        qdrant_client_obj.delete_collection(collection_name=delete_collection)
                         st.success(f"Collection '{delete_collection}' deleted successfully!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error deleting collection: {str(e)}")
-                        
+        
         except Exception as e:
-            st.error(f"Error connecting to ChromaDB: {str(e)}")
-            st.info("Make sure you have a ChromaDB server configured or update your secrets with ChromaDB configuration.")
+            st.error(f"Error connecting to Qdrant: {str(e)}")
+            st.info("Please configure Qdrant connection in secrets.")
     
     with tab2:
         st.subheader("Usage Analytics")
@@ -756,33 +780,30 @@ def process_user_query(query):
         message_placeholder.markdown("Searching HR policies...")
     
     try:
-        # Get ChromaDB client
-        chroma_client = get_chroma_client()
+        # Get Qdrant client
+        qdrant_client_obj = get_qdrant_client()
         
         # Check if any collections exist
-        collections = chroma_client.list_collections()
+        collections = qdrant_client_obj.get_collections().collections
         collection_names = [collection.name for collection in collections]
         
         if not collection_names:
             response = "I don't have any HR policy documents loaded yet. Please ask your HR administrator to upload some policy documents."
         else:
             # Use the first collection for employee queries
-            collection = get_or_create_collection(chroma_client, collection_names[0])
+            collection_name = collection_names[0]
             
-            if collection:
-                # Retrieve relevant chunks
-                with st.spinner("Searching HR policies..."):
-                    search_results = retrieve_relevant_chunks(collection, query)
-                    
-                    # Rerank results if we have more than one result
-                    if len(search_results["documents"]) > 1:
-                        search_results = rerank_with_claude(query, search_results)
+            # Retrieve relevant chunks
+            with st.spinner("Searching HR policies..."):
+                search_results = retrieve_relevant_chunks(qdrant_client_obj, collection_name, query)
                 
-                # Generate response with Claude
-                with st.spinner("Finding your answer..."):
-                    response = generate_hr_response(query, search_results)
-            else:
-                response = "I'm having trouble accessing the HR policy documents. Please try again later or contact HR directly."
+                # Rerank results if we have more than one result
+                if len(search_results["documents"]) > 1:
+                    search_results = rerank_with_claude(query, search_results)
+            
+            # Generate response with Claude
+            with st.spinner("Finding your answer..."):
+                response = generate_hr_response(query, search_results)
     
     except Exception as e:
         st.error(f"Error processing query: {str(e)}")
