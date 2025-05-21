@@ -131,7 +131,7 @@ def get_claude_embeddings(texts):
             
         try:
             response = anthropic_client.embeddings.create(
-                model="claude-3-haiku-20240307",
+                model="claude-3-7-sonnet-20250219",
                 input=text
             )
             embeddings.append(response.embedding)
@@ -222,7 +222,7 @@ def process_document_with_claude(file_content, file_name):
     
     try:
         response = anthropic_client.messages.create(
-            model="claude-3-sonnet-20240229",
+            model="claude-3-7-sonnet-20250219",
             max_tokens=4000,
             system=system_prompt,
             messages=[{"role": "user", "content": f"Document name: {file_name}\n\nContent:\n{truncated_content}"}]
