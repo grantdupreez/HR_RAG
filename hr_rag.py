@@ -274,7 +274,7 @@ def process_document_with_claude(file_content, file_name):
         # Try to clean the JSON string
         # Remove any non-JSON text before or after the JSON structure
         json_str = re.sub(r'^[^{]*', '', json_str)
-        json_str = re.sub(r'[^}]*
+        json_str = re.sub(r'[^}]*$', '', json_str)
 
 def fallback_chunking(text, file_name):
     """Fall back to simple chunking if Claude processing fails."""
