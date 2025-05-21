@@ -367,6 +367,8 @@ def add_document_to_qdrant(client, collection_name, processed_doc, document_id):
 
 def retrieve_relevant_chunks(client, collection_name, query, top_k=5):
     """Retrieve relevant chunks based on the query."""
+    debug_mode = st.session_state.get("debug_mode", False)
+    
     try:
         # Get embeddings for the query
         query_embedding = get_claude_embeddings([query])[0]
@@ -378,16 +380,59 @@ def retrieve_relevant_chunks(client, collection_name, query, top_k=5):
             limit=top_k
         )
         
+        if debug_mode:
+            st.write(f"Raw search results count: {len(search_results)}")
+            if search_results:
+                # Display the structure of the first result to debug
+                first_result = search_results[0]
+                st.write(f"First result type: {type(first_result)}")
+                
+                if hasattr(first_result, 'payload'):
+                    st.write(f"Payload type: {type(first_result.payload)}")
+                    st.write(f"Payload keys: {first_result.payload.keys() if first_result.payload else 'None'}")
+        
         # Extract and format results
         documents = []
         metadatas = []
         scores = []
         
-        for result in search_results:
-            documents.append(result.payload["content"])
-            metadatas.append(result.payload["metadata"])
-            scores.append(result.score)
+        for i, result in enumerate(search_results):
+            # Add defensive checks for payload structure
+            if not hasattr(result, 'payload') or not result.payload:
+                if debug_mode:
+                    st.warning(f"Result {i}: Missing payload")
+                continue
+            
+            # Check if the payload structure is what we expect
+            if "content" not in result.payload:
+                # Check if the content is actually inside the metadata
+                metadata = result.payload.get("metadata", {})
+                if metadata and isinstance(metadata, dict) and "content" in metadata:
+                    # If content is in metadata, use that
+                    content = metadata["content"]
+                else:
+                    # Dump the payload structure for debugging
+                    if debug_mode:
+                        st.warning(f"Result {i}: No content field in payload. Keys: {list(result.payload.keys())}")
+                        st.json(result.payload)
+                    continue
+            else:
+                # Normal case - content is directly in payload
+                content = result.payload["content"]
+                
+            # Extract metadata safely
+            metadata = result.payload.get("metadata", {})
+            score = getattr(result, "score", 0.0)
+            
+            # Add to our result lists
+            documents.append(content)
+            metadatas.append(metadata)
+            scores.append(score)
         
+        # If we couldn't extract any documents, log a clear message
+        if not documents and debug_mode:
+            st.warning("No valid documents were found in the search results.")
+            
         return {
             "documents": documents,
             "metadatas": metadatas,
@@ -395,7 +440,14 @@ def retrieve_relevant_chunks(client, collection_name, query, top_k=5):
         }
     
     except Exception as e:
-        st.error(f"Error searching Qdrant: {str(e)}")
+        if debug_mode:
+            st.error(f"Error searching Qdrant: {str(e)}")
+            # Include the traceback for more detailed error info
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+        else:
+            st.error(f"Error searching Qdrant. Enable debug mode for details.")
+            
         return {
             "documents": [],
             "metadatas": [],
@@ -735,6 +787,16 @@ def show_employee_chat():
     st.header("🚀 CareerVertex: HR Policy & Benefits Assistant")
     st.markdown("*Your guide to workplace policies, benefits, and HR procedures*")
     
+    # Add a debug mode toggle in the sidebar
+    debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
+    if debug_mode:
+        st.sidebar.info("Debug mode is ON. You'll see detailed error messages and debugging information.")
+    else:
+        # Create a placeholder for the session state to store this value
+        if "debug_mode" not in st.session_state:
+            st.session_state.debug_mode = False
+        st.session_state.debug_mode = False
+    
     # Initialize chat history if needed
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -812,6 +874,9 @@ def process_user_query(query):
         message_placeholder = st.empty()
         message_placeholder.markdown("Searching HR policies...")
     
+    # Debug mode check
+    debug_mode = st.session_state.get("debug_mode", False)
+    
     try:
         # Get Qdrant client
         qdrant_client_obj = get_qdrant_client()
@@ -826,20 +891,45 @@ def process_user_query(query):
             # Use the first collection for employee queries
             collection_name = collection_names[0]
             
+            # Add debugging information
+            if debug_mode:
+                st.info(f"Using collection: {collection_name}")
+            
             # Retrieve relevant chunks
             with st.spinner("Searching HR policies..."):
-                search_results = retrieve_relevant_chunks(qdrant_client_obj, collection_name, query)
-                
-                # Rerank results if we have more than one result
-                if len(search_results["documents"]) > 1:
-                    search_results = rerank_with_claude(query, search_results)
+                try:
+                    search_results = retrieve_relevant_chunks(qdrant_client_obj, collection_name, query)
+                    
+                    # Debug info about what we got back
+                    if debug_mode:
+                        st.info(f"Retrieved {len(search_results['documents'])} documents")
+                        if search_results['documents']:
+                            st.info(f"First document sample: {search_results['documents'][0][:100]}...")
+                    
+                    # Rerank results if we have more than one result
+                    if len(search_results["documents"]) > 1:
+                        search_results = rerank_with_claude(query, search_results)
+                except Exception as e:
+                    import traceback
+                    error_trace = traceback.format_exc()
+                    if debug_mode:
+                        st.error(f"Error during retrieval: {str(e)}")
+                        st.error(f"Traceback: {error_trace}")
+                    search_results = {"documents": [], "metadatas": [], "scores": []}
             
             # Generate response with Claude
             with st.spinner("Finding your answer..."):
-                response = generate_hr_response(query, search_results)
+                if search_results["documents"]:
+                    response = generate_hr_response(query, search_results)
+                else:
+                    response = "I couldn't find any relevant information in our HR policy documents. Please contact HR directly for assistance with your question."
     
     except Exception as e:
-        st.error(f"Error processing query: {str(e)}")
+        import traceback
+        error_trace = traceback.format_exc()
+        if debug_mode:
+            st.error(f"Error processing query: {str(e)}")
+            st.error(f"Traceback: {error_trace}")
         response = "I encountered an error while trying to answer your question. Please try again later or contact HR directly."
     
     # Update assistant message
